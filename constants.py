@@ -50,7 +50,8 @@ RAG_TOP_FOLDER_PATH = "./data"
 SUPPORTED_EXTENSIONS = {
     ".pdf": PyMuPDFLoader,
     ".docx": Docx2txtLoader,
-    ".csv": lambda path: CSVLoader(path, encoding="utf-8")
+    ".csv": lambda path: CSVLoader(path, encoding="utf-8"),
+    ".txt": lambda path: TextLoader(path, encoding="utf-8")
 }
 WEB_URL_LOAD_TARGETS = [
     "https://generative-ai.web-camp.io/"
@@ -60,7 +61,7 @@ WEB_URL_LOAD_TARGETS = [
 # ==========================================
 # チャンク分割設定
 # ==========================================
-CHUNK_SIZE = 500
+CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 50
 
 
@@ -93,6 +94,7 @@ SYSTEM_PROMPT_INQUIRY = """
     5. マークダウン記法で回答する際にhタグの見出しを使う場合、最も大きい見出しをh3としてください。
     6. 複雑な質問の場合、各項目についてそれぞれ詳細に回答してください。
     7. 必要と判断した場合は、以下の文脈に基づかずとも、一般的な情報を回答してください。
+    8. 部署一覧の照会の場合は、該当部署の従業員を可能な限り列挙すること
 
     {context}
 """

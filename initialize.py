@@ -17,10 +17,23 @@ from dotenv import load_dotenv
 import streamlit as st
 from docx import Document
 from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.document_loaders import TextLoader
+from langchain_community.document_loaders.csv_loader import CSVLoader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 import constants as ct
+from charset_normalizer import from_path as cn_from_path
+import csv
+from collections import defaultdict
+# LangChain の Document 型（docx.Document と名称衝突しないように別名）
+try:
+    from langchain_core.documents import Document as LC_Document
+except Exception:
+    try:
+        from langchain.schema import Document as LC_Document
+    except Exception:
+        from langchain.docstore.document import Document as LC_Document
 
 
 ############################################################
@@ -216,10 +229,84 @@ def file_load(path, docs_all):
 
     # 想定していたファイル形式の場合のみ読み込む
     if file_extension in ct.SUPPORTED_EXTENSIONS:
-        # ファイルの拡張子に合ったdata loaderを使ってデータ読み込み
-        loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
-        docs = loader.load()
-        docs_all.extend(docs)
+        logger = logging.getLogger(ct.LOGGER_NAME)
+
+        # テキストファイルはエンコーディング差異で失敗しやすいため、まず charset-normalizer で判定
+        if file_extension == ".txt":
+            encoding = None
+            try:
+                best = cn_from_path(path).best()
+                if best and best.encoding:
+                    encoding = best.encoding
+            except Exception as e:
+                # 検出に失敗してもフォールバックするため WARNING ログのみに留める
+                logger.warning(f"charset-normalizer によるエンコーディング検出に失敗しました: {file_name} ({file_extension})\n{e}")
+
+            if encoding:
+                try:
+                    docs = TextLoader(path, encoding=encoding).load()
+                    docs_all.extend(docs)
+                    return
+                except Exception as e:
+                    logger.warning(f"検出エンコーディングでの読み込みに失敗しました (encoding={encoding}): {file_name}\n{e}")
+
+            # 検出できなかった or 失敗した場合は一般的な候補でフォールバック
+            for enc in ["utf-8", "utf-8-sig", "cp932", "shift_jis"]:
+                try:
+                    docs = TextLoader(path, encoding=enc).load()
+                    docs_all.extend(docs)
+                    return
+                except Exception:
+                    continue
+            # すべて失敗した場合のみエラーを記録
+            logger.error(f"テキストファイルの読み込みに失敗しました: {file_name} ({file_extension})")
+        elif file_extension == ".csv":
+            # CSV もエンコーディング差異で失敗しやすいため、同様に検出 + フォールバック
+            encoding = None
+            try:
+                best = cn_from_path(path).best()
+                if best and best.encoding:
+                    encoding = best.encoding
+            except Exception as e:
+                logger.warning(f"charset-normalizer によるエンコーディング検出に失敗しました: {file_name} ({file_extension})\n{e}")
+
+            def try_load_with(enc: str):
+                """
+                指定エンコーディングで CSV を読み込み。
+                社員名簿.csv の場合は、各行ドキュメントを 1 ドキュメントへ統合する。
+                それ以外の CSV は従来通り 1 行 = 1 ドキュメント。
+                """
+                if file_name == "社員名簿.csv":
+                    merged_docs = load_employee_master_csv(path, enc)
+                    return merged_docs
+                else:
+                    return CSVLoader(path, encoding=enc).load()
+
+            if encoding:
+                try:
+                    docs = try_load_with(encoding)
+                    docs_all.extend(docs)
+                    return
+                except Exception as e:
+                    logger.warning(f"検出エンコーディングでのCSV読み込みに失敗しました (encoding={encoding}): {file_name}\n{e}")
+
+            for enc in ["utf-8", "utf-8-sig", "cp932", "shift_jis"]:
+                try:
+                    docs = try_load_with(enc)
+                    docs_all.extend(docs)
+                    return
+                except Exception:
+                    continue
+            logger.error(f"CSVファイルの読み込みに失敗しました: {file_name} ({file_extension})")
+        else:
+            # テキスト以外は従来通りのローダー処理
+            loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
+            try:
+                docs = loader.load()
+                docs_all.extend(docs)
+            except Exception as e:
+                # 読み込み失敗時はログに記録し、該当ファイルをスキップして続行
+                logger.error(f"データソースの読み込みに失敗しました: {file_name} ({file_extension})\n{e}")
 
 
 def adjust_string(s):
@@ -244,3 +331,66 @@ def adjust_string(s):
     
     # OSがWindows以外の場合はそのまま返す
     return s
+
+
+def load_employee_master_csv(path: str, encoding: str) -> list:
+    """
+    社員名簿.csv を部門別にまとめた 1 つの統合ドキュメントへ変換する。
+
+    各行を 1 ドキュメントにせず、部門（部署）ごとにセクション化したテキストを生成することで、
+    「人事部に所属している従業員情報を一覧化して」のような問い合わせ時に、
+    検索でヒットした数少ないチャンクからでも複数名を同時に参照できるようにする。
+
+    Returns:
+        List[LC_Document]: 統合後のドキュメント（1件のみ）
+    """
+    # CSV 読み込み
+    with open(path, mode="r", encoding=encoding, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    # 部門（部署）ごとにグルーピング
+    dept_key = "部署"
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        dept = (row.get(dept_key) or "不明").strip()
+        groups[dept].append(row)
+
+    # 検索しやすいよう、見出し・キーワードを明示しつつ部門別のまとまりを作成
+    # 重要キーワード（部署名や「人事部」「従業員一覧」等）を繰り返し明示
+    lines: list[str] = []
+    lines.append("社員名簿（統合ドキュメント）")
+    lines.append("この文書は CSV を統合し、部門（部署）ごとの従業員一覧をまとめたものです。")
+    lines.append("")
+    lines.append("[部門インデックス]")
+    for dept in sorted(groups.keys()):
+        lines.append(f"- 部署: {dept}（従業員数: {len(groups[dept])}）")
+    lines.append("")
+
+    # 出力に含める主な列（チャンクに収まるよう必要最小限に絞る）
+    col_id = "社員ID"
+    col_name = "氏名（フルネーム）"
+    col_role = "役職"
+    col_mail = "メールアドレス"
+
+    for dept in sorted(groups.keys()):
+        members = groups[dept]
+        lines.append(f"### {dept} 従業員一覧（部署: {dept}）")
+        for m in members:
+            # 各行を検索に強い定型に整形（短く要点のみ。1部門が 1 チャンクに収まることを優先）
+            rec = (
+                f"部署: {dept} | 氏名: {m.get(col_name, '')} | 社員ID: {m.get(col_id, '')} | 役職: {m.get(col_role, '')} | メール: {m.get(col_mail, '')}"
+            )
+            lines.append(f"- {rec}")
+        lines.append("")
+
+    content = "\n".join(lines)
+
+    # メタデータも付与
+    metadata = {
+        "source": path,
+        "filename": os.path.basename(path),
+        "document_type": "employee_master_csv_merged",
+    }
+
+    return [LC_Document(page_content=content, metadata=metadata)]
